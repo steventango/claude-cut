@@ -8,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
@@ -133,21 +132,31 @@ def merge_speech_segments(segments, merge_gap=0.5, padding=0.25, total_duration=
     return merged
 
 
-def build_srt(segments, cut_segments, temp_dir):
-    """Build SRT file with timestamps adjusted for the cut video."""
-    # Build a mapping from original time -> cut time
-    # For each position in the original video, compute where it lands in the cut video
-    cut_offset = 0.0
-    time_map = []  # (orig_start, orig_end, cut_start)
-    for orig_start, orig_end in cut_segments:
-        time_map.append((orig_start, orig_end, cut_offset))
-        cut_offset += orig_end - orig_start
+def build_select_expr(segments):
+    """Build ffmpeg select/aselect filter expression from segments."""
+    parts = [f"between(t,{s:.3f},{e:.3f})" for s, e in segments]
+    return "+".join(parts)
+
+
+def remap_srt(segments, cut_segments, temp_dir):
+    """Remap whisper timestamps to the cut timeline and write SRT.
+
+    Uses the same arithmetic as ffmpeg's select+setpts filters:
+    the cut timeline is the original timestamps with gaps removed.
+    """
+    # Precompute cumulative gap before each cut segment
+    # cut_time = orig_time - total_gap_before(orig_time)
+    gap_before = []
+    total_gap = cut_segments[0][0]  # gap before first segment
+    gap_before.append((cut_segments[0][0], cut_segments[0][1], total_gap))
+    for i in range(1, len(cut_segments)):
+        total_gap += cut_segments[i][0] - cut_segments[i - 1][1]
+        gap_before.append((cut_segments[i][0], cut_segments[i][1], total_gap))
 
     def map_time(t):
-        """Map an original timestamp to the cut video timeline."""
-        for orig_start, orig_end, cut_start in time_map:
-            if orig_start <= t <= orig_end:
-                return cut_start + (t - orig_start)
+        for seg_start, seg_end, gap in gap_before:
+            if seg_start <= t <= seg_end:
+                return t - gap
         return None
 
     srt_lines = []
@@ -170,60 +179,24 @@ def build_srt(segments, cut_segments, temp_dir):
     return srt_path
 
 
-def _extract_segment(args):
-    """Extract a single segment, re-encoding for frame-accurate cuts."""
-    idx, start, end, input_path, output_path = args
-    duration = end - start
-    run_ffmpeg([
-        "-ss", str(start), "-i", input_path,
-        "-t", str(duration),
-        "-map", "0:v:0", "-map", "0:a:0",
-        "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22",
-        "-c:a", "aac", "-b:a", "192k",
-        "-avoid_negative_ts", "make_zero",
-        "-y", "-loglevel", "warning",
-        output_path,
-    ], desc=f"segment {idx}")
-    return idx
-
-
-def stage4_cut_video(input_path, segments, temp_dir, max_workers=3):
-    """Cut video segments and concatenate them."""
-    print(f"[Stage 4/5] Cutting {len(segments)} segments...")
+def stage4_cut_video(input_path, segments, temp_dir):
+    """Cut video in a single ffmpeg pass using select/aselect filters."""
+    print(f"[Stage 4/5] Cutting video (single pass, {len(segments)} segments)...")
     t0 = time.time()
 
-    # Prepare segment extraction tasks
-    tasks = []
-    for idx, (start, end) in enumerate(segments):
-        seg_path = os.path.join(temp_dir, f"segment_{idx:04d}.mp4")
-        tasks.append((idx, start, end, input_path, seg_path))
-
-    # Encode segments in parallel (NVENC limit: ~3 concurrent sessions)
-    completed = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_extract_segment, task): task[0] for task in tasks}
-        for future in as_completed(futures):
-            future.result()  # Raise if failed
-            completed += 1
-            if completed % 20 == 0 or completed == len(tasks):
-                print(f"  Extracted {completed}/{len(tasks)} segments")
-
-    # Create concat list
-    concat_path = os.path.join(temp_dir, "concat_list.txt")
-    with open(concat_path, "w") as f:
-        for idx in range(len(segments)):
-            seg_path = os.path.join(temp_dir, f"segment_{idx:04d}.mp4")
-            f.write(f"file '{seg_path}'\n")
-
-    # Concatenate
+    select_expr = build_select_expr(segments)
     cut_path = os.path.join(temp_dir, "output_cut.mp4")
+
     run_ffmpeg([
-        "-f", "concat", "-safe", "0",
-        "-i", concat_path,
-        "-c", "copy",
+        "-i", input_path,
+        "-map", "0:v:0", "-map", "0:a:0",
+        "-vf", f"select='{select_expr}',setpts=N/FRAME_RATE/TB",
+        "-af", f"aselect='{select_expr}',asetpts=N/SR/TB",
+        "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22",
+        "-c:a", "aac", "-b:a", "192k",
         "-y", "-loglevel", "warning",
         cut_path,
-    ], desc="concatenation")
+    ], desc="single-pass cut")
 
     print(f"  Done ({time.time() - t0:.1f}s)")
     return cut_path
@@ -315,10 +288,10 @@ def main():
         print(f"  Removing {reduction:.1f}% of video (non-speech)")
         print()
 
-        # Build SRT with timestamps mapped to cut video
-        srt_path = build_srt(segments, cut_segments, temp_dir)
+        # Build SRT with timestamps remapped to cut timeline
+        srt_path = remap_srt(segments, cut_segments, temp_dir)
 
-        # Stage 4: Cut & concat
+        # Stage 4: Single-pass cut
         cut_path = stage4_cut_video(input_path, cut_segments, temp_dir)
 
         # Stage 5: Burn subtitles
