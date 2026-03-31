@@ -1,5 +1,3 @@
 torch
 torchaudio
-pyannote.audio
 faster-whisper
-python-dotenv

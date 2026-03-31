@@ -11,8 +11,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 
 FFMPEG_BIN = "ffmpeg"
 FFPROBE_BIN = "ffprobe"
@@ -37,9 +35,18 @@ def format_time(seconds):
     return f"{h}:{m:02d}:{s:06.3f}"
 
 
+def _seconds_to_srt_time(seconds):
+    """Convert seconds to SRT timestamp format HH:MM:SS,mmm."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 def stage1_extract_audio(input_path, temp_dir, audio_stream=1):
-    """Extract mono 16kHz WAV audio for VAD and transcription."""
-    print("[Stage 1/6] Extracting audio...")
+    """Extract mono 16kHz WAV audio for whisper."""
+    print("[Stage 1/5] Extracting audio...")
     t0 = time.time()
     audio_path = os.path.join(temp_dir, "audio_16k_mono.wav")
     run_ffmpeg([
@@ -54,57 +61,56 @@ def stage1_extract_audio(input_path, temp_dir, audio_stream=1):
     return audio_path
 
 
-def stage2_detect_speech(audio_path, hf_token):
-    """Run pyannote VAD to detect speech segments."""
-    print("[Stage 2/6] Detecting speech with pyannote...")
+def stage2_transcribe(audio_path, whisper_model="large-v3", language="en"):
+    """Transcribe audio with faster-whisper (uses Silero VAD internally)."""
+    print(f"[Stage 2/5] Transcribing with faster-whisper ({whisper_model})...")
+    print("  (Silero VAD filters non-speech automatically)")
     t0 = time.time()
 
-    import torch
-    import soundfile as sf
-    from pyannote.audio import Model
-    from pyannote.audio.pipelines import VoiceActivityDetection
+    from faster_whisper import WhisperModel
 
-    # cuDNN 9.x (bundled in torch 2.5+) fails on LSTM/RNN ops with driver 535:
-    #   "cuDNN error: CUDNN_STATUS_NOT_INITIALIZED"
-    # Disabling cuDNN makes PyTorch use its own CUDA LSTM kernels instead.
-    # Remove this once the NVIDIA driver is upgraded to 545+.
-    torch.backends.cudnn.enabled = False
+    model = WhisperModel(whisper_model, device="cuda", compute_type="float16")
+    segments_iter, info = model.transcribe(
+        audio_path,
+        beam_size=5,
+        language=language,
+        vad_filter=True,
+        vad_parameters=dict(
+            min_speech_duration_ms=250,
+            min_silence_duration_ms=500,
+            speech_pad_ms=250,
+        ),
+        word_timestamps=True,
+    )
 
-    model = Model.from_pretrained("pyannote/segmentation-3.0", token=hf_token)
-    pipeline = VoiceActivityDetection(segmentation=model)
-    pipeline.to(torch.device("cuda"))
+    # Collect segments with their timestamps and text
+    segments = []
+    for segment in segments_iter:
+        segments.append({
+            "start": segment.start,
+            "end": segment.end,
+            "text": segment.text.strip(),
+        })
 
-    # segmentation-3.0 is a powerset model (onset/offset fixed at 0.5)
-    HYPER = {
-        "min_duration_on": 0.055,
-        "min_duration_off": 0.098,
-    }
-    pipeline.instantiate(HYPER)
-
-    # Load audio with soundfile to bypass broken torchcodec
-    data, sample_rate = sf.read(audio_path, dtype="float32")
-    waveform = torch.from_numpy(data).unsqueeze(0)  # (1, num_samples)
-    audio_input = {"waveform": waveform, "sample_rate": sample_rate}
-
-    vad_result = pipeline(audio_input)
-    segments = [(seg.start, seg.end) for seg in vad_result.get_timeline()]
-
-    total_speech = sum(e - s for s, e in segments)
-    print(f"  Found {len(segments)} raw speech segments ({total_speech:.1f}s total)")
+    total_speech = sum(s["end"] - s["start"] for s in segments)
+    print(f"  Found {len(segments)} speech segments ({total_speech:.1f}s total)")
     print(f"  Done ({time.time() - t0:.1f}s)")
     return segments
 
 
-def stage3_merge_segments(segments, merge_gap=0.5, padding=0.25, total_duration=None):
-    """Merge nearby segments and add padding."""
-    print("[Stage 3/6] Merging segments...")
+def merge_speech_segments(segments, merge_gap=0.5, padding=0.25, total_duration=None):
+    """Merge nearby speech segments for video cutting."""
+    print("[Stage 3/5] Merging segments for cutting...")
     if not segments:
         print("  No speech segments found!")
-        return []
+        return [], []
+
+    # Extract time ranges
+    ranges = [(s["start"], s["end"]) for s in segments]
 
     # Add padding
     padded = []
-    for s, e in segments:
+    for s, e in ranges:
         new_s = max(0, s - padding)
         new_e = e + padding if total_duration is None else min(total_duration, e + padding)
         padded.append((new_s, new_e))
@@ -119,12 +125,49 @@ def stage3_merge_segments(segments, merge_gap=0.5, padding=0.25, total_duration=
         else:
             merged.append((start, end))
 
-    # Filter out segments shorter than 0.5s (too short to encode reliably)
+    # Filter out segments shorter than 0.5s
     merged = [(s, e) for s, e in merged if e - s >= 0.5]
 
     total_speech = sum(e - s for s, e in merged)
     print(f"  {len(merged)} merged segments ({total_speech:.1f}s total)")
     return merged
+
+
+def build_srt(segments, cut_segments, temp_dir):
+    """Build SRT file with timestamps adjusted for the cut video."""
+    # Build a mapping from original time -> cut time
+    # For each position in the original video, compute where it lands in the cut video
+    cut_offset = 0.0
+    time_map = []  # (orig_start, orig_end, cut_start)
+    for orig_start, orig_end in cut_segments:
+        time_map.append((orig_start, orig_end, cut_offset))
+        cut_offset += orig_end - orig_start
+
+    def map_time(t):
+        """Map an original timestamp to the cut video timeline."""
+        for orig_start, orig_end, cut_start in time_map:
+            if orig_start <= t <= orig_end:
+                return cut_start + (t - orig_start)
+        return None
+
+    srt_lines = []
+    idx = 1
+    for seg in segments:
+        new_start = map_time(seg["start"])
+        new_end = map_time(seg["end"])
+        if new_start is not None and new_end is not None and new_end > new_start:
+            start_srt = _seconds_to_srt_time(new_start)
+            end_srt = _seconds_to_srt_time(new_end)
+            srt_lines.append(f"{idx}\n{start_srt} --> {end_srt}\n{seg['text']}\n")
+            idx += 1
+
+    srt_content = "\n".join(srt_lines)
+    srt_path = os.path.join(temp_dir, "output.srt")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write(srt_content)
+
+    print(f"  Generated {len(srt_lines)} subtitle entries")
+    return srt_path
 
 
 def _extract_segment(args):
@@ -146,7 +189,7 @@ def _extract_segment(args):
 
 def stage4_cut_video(input_path, segments, temp_dir, max_workers=3):
     """Cut video segments and concatenate them."""
-    print(f"[Stage 4/6] Cutting {len(segments)} segments (stream copy)...")
+    print(f"[Stage 4/5] Cutting {len(segments)} segments...")
     t0 = time.time()
 
     # Prepare segment extraction tasks
@@ -155,7 +198,7 @@ def stage4_cut_video(input_path, segments, temp_dir, max_workers=3):
         seg_path = os.path.join(temp_dir, f"segment_{idx:04d}.mp4")
         tasks.append((idx, start, end, input_path, seg_path))
 
-    # Extract segments in parallel
+    # Encode segments in parallel (NVENC limit: ~3 concurrent sessions)
     completed = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_extract_segment, task): task[0] for task in tasks}
@@ -186,62 +229,9 @@ def stage4_cut_video(input_path, segments, temp_dir, max_workers=3):
     return cut_path
 
 
-def stage5_transcribe(cut_video_path, temp_dir, whisper_model="large-v3", language="en"):
-    """Transcribe cut video and generate SRT."""
-    print(f"[Stage 5/6] Transcribing with faster-whisper ({whisper_model})...")
-    t0 = time.time()
-
-    # Extract audio from cut video
-    cut_audio_path = os.path.join(temp_dir, "cut_audio.wav")
-    run_ffmpeg([
-        "-i", cut_video_path,
-        "-ac", "1", "-ar", "16000",
-        "-c:a", "pcm_s16le",
-        "-y", "-loglevel", "warning",
-        cut_audio_path,
-    ], desc="cut audio extraction")
-
-    from faster_whisper import WhisperModel
-
-    model = WhisperModel(whisper_model, device="cuda", compute_type="float16")
-    segments_iter, info = model.transcribe(
-        cut_audio_path,
-        beam_size=5,
-        language=language,
-        vad_filter=False,
-        word_timestamps=True,
-    )
-
-    # Build SRT content
-    srt_lines = []
-    for i, segment in enumerate(segments_iter, 1):
-        start_srt = _seconds_to_srt_time(segment.start)
-        end_srt = _seconds_to_srt_time(segment.end)
-        text = segment.text.strip()
-        srt_lines.append(f"{i}\n{start_srt} --> {end_srt}\n{text}\n")
-
-    srt_content = "\n".join(srt_lines)
-    srt_path = os.path.join(temp_dir, "output.srt")
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write(srt_content)
-
-    print(f"  Generated {len(srt_lines)} subtitle entries")
-    print(f"  Done ({time.time() - t0:.1f}s)")
-    return srt_path
-
-
-def _seconds_to_srt_time(seconds):
-    """Convert seconds to SRT timestamp format HH:MM:SS,mmm."""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def stage6_burn_subtitles(cut_video_path, srt_path, output_path):
+def stage5_burn_subtitles(cut_video_path, srt_path, output_path):
     """Burn subtitles into video using libass."""
-    print("[Stage 6/6] Burning subtitles...")
+    print("[Stage 5/5] Burning subtitles...")
     t0 = time.time()
 
     run_ffmpeg([
@@ -279,14 +269,6 @@ def main():
     parser.add_argument("--keep-temp", action="store_true", help="Keep temporary files")
     args = parser.parse_args()
 
-    # Load .env
-    load_dotenv()
-    hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
-        print("ERROR: HF_TOKEN not found. Set it in .env or as an environment variable.", file=sys.stderr)
-        print("You need to accept terms at https://huggingface.co/pyannote/segmentation-3.0", file=sys.stderr)
-        sys.exit(1)
-
     input_path = os.path.abspath(args.input)
     if not os.path.exists(input_path):
         print(f"ERROR: Input file not found: {input_path}", file=sys.stderr)
@@ -314,29 +296,33 @@ def main():
         # Stage 1: Extract audio
         audio_path = stage1_extract_audio(input_path, temp_dir, args.audio_stream)
 
-        # Stage 2: VAD
-        raw_segments = stage2_detect_speech(audio_path, hf_token)
+        # Stage 2: Transcribe (with Silero VAD built into faster-whisper)
+        segments = stage2_transcribe(audio_path, args.whisper_model, args.language)
 
-        # Stage 3: Merge
-        merged_segments = stage3_merge_segments(
-            raw_segments, args.merge_gap, args.padding, duration
-        )
-        if not merged_segments:
+        if not segments:
             print("No speech detected. Exiting.")
             sys.exit(0)
 
-        reduction = (1 - sum(e - s for s, e in merged_segments) / duration) * 100
+        # Stage 3: Merge segments for cutting
+        cut_segments = merge_speech_segments(
+            segments, args.merge_gap, args.padding, duration
+        )
+        if not cut_segments:
+            print("No segments after merging. Exiting.")
+            sys.exit(0)
+
+        reduction = (1 - sum(e - s for s, e in cut_segments) / duration) * 100
         print(f"  Removing {reduction:.1f}% of video (non-speech)")
         print()
 
+        # Build SRT with timestamps mapped to cut video
+        srt_path = build_srt(segments, cut_segments, temp_dir)
+
         # Stage 4: Cut & concat
-        cut_path = stage4_cut_video(input_path, merged_segments, temp_dir)
+        cut_path = stage4_cut_video(input_path, cut_segments, temp_dir)
 
-        # Stage 5: Transcribe
-        srt_path = stage5_transcribe(cut_path, temp_dir, args.whisper_model, args.language)
-
-        # Stage 6: Burn subtitles
-        stage6_burn_subtitles(cut_path, srt_path, output_path)
+        # Stage 5: Burn subtitles
+        stage5_burn_subtitles(cut_path, srt_path, output_path)
 
         # Copy SRT to output location
         shutil.copy2(srt_path, srt_output_path)
